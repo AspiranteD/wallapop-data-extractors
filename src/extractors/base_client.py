@@ -153,7 +153,8 @@ class WallapopAPIClient(ABC):
                     return None
 
                 if response.status_code == 429:
-                    backoff = (2 ** attempt) + random.uniform(0, 0.5)
+                    base_delay = 2 ** attempt
+                    backoff = base_delay + random.uniform(0, base_delay * 0.3)
                     logger.warning("Rate limited (429), backing off %.1fs", backoff)
                     time.sleep(backoff)
                     continue

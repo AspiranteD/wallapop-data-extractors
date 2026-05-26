@@ -6,9 +6,8 @@ Production-grade data extraction framework for the Wallapop marketplace API. Ext
 
 ```
 src/
-├── client/
-│   └── base_client.py         # Abstract API client: anti-detection, retries, rate limiting
 ├── extractors/
+│   ├── base_client.py         # Abstract API client: anti-detection, retries, rate limiting
 │   ├── orders.py              # Orders extractor with bundle/LPN/shipping enrichment
 │   ├── chats.py               # Conversations extractor with change detection
 │   └── listings.py            # Listings extractor with anti-oscillation
