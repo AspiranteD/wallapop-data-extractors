@@ -1,62 +1,64 @@
-"""Tests for the orders extractor."""
-from src.extractors.orders import (
-    WallapopOrdersExtractor,
-    OrderResult,
-    WALLAPOP_TO_INTERNAL,
-    LPN_PATTERN,
-)
+"""Tests for orders extractor."""
+import pytest
+from src.extractors.orders import WallapopOrdersExtractor
+from src.parsers.status import WALLAPOP_TO_INTERNAL
+
+
+class TestBundleHashExtraction:
+    def test_extracts_from_wallapop_links(self):
+        bundle = {
+            "details_info": [
+                {"action": {"payload": {"link_url": "wallapop://i/hash1"}}},
+                {"action": {"payload": {"link_url": "wallapop://i/hash2"}}},
+                {"action": {"payload": {"link_url": "https://not-a-product"}}},
+                {"action": {"payload": {}}},
+            ]
+        }
+        hashes = WallapopOrdersExtractor._extract_hashes_from_bundle(bundle)
+        assert hashes == ["hash1", "hash2"]
+
+    def test_deduplicates(self):
+        bundle = {
+            "details_info": [
+                {"action": {"payload": {"link_url": "wallapop://i/same"}}},
+                {"action": {"payload": {"link_url": "wallapop://i/same"}}},
+            ]
+        }
+        assert len(WallapopOrdersExtractor._extract_hashes_from_bundle(bundle)) == 1
+
+    def test_empty_details(self):
+        assert WallapopOrdersExtractor._extract_hashes_from_bundle({"details_info": []}) == []
+        assert WallapopOrdersExtractor._extract_hashes_from_bundle({}) == []
 
 
 class TestStatusMapping:
+    def test_all_statuses_mapped(self):
+        assert len(WALLAPOP_TO_INTERNAL) >= 18
 
-    def test_all_statuses_map(self):
-        for wallapop_status, internal in WALLAPOP_TO_INTERNAL.items():
-            assert internal in {
-                "PENDING_SHIPMENT", "SHIPPED", "DELIVERED",
-                "INCIDENT", "RETURNING", "CANCELLED",
-            }, f"Unexpected internal status {internal} for {wallapop_status}"
+    def test_por_enviar_states(self):
+        for s in ["TRANSACTION_CREATED", "REQUEST_CREATED", "PENDING_TO_MEET"]:
+            assert WALLAPOP_TO_INTERNAL[s] == "POR_ENVIAR"
 
-    def test_shipped_states(self):
-        shipped = [k for k, v in WALLAPOP_TO_INTERNAL.items() if v == "SHIPPED"]
-        assert len(shipped) >= 6  # IN_TRANSIT, DELIVERED_TO_CARRIER, etc.
-
-    def test_incident_states(self):
-        incidents = [k for k, v in WALLAPOP_TO_INTERNAL.items() if v == "INCIDENT"]
-        assert "DISPUTE_OPEN" in incidents
-        assert "DISPUTE_ESCALATED" in incidents
+    def test_enviado_states(self):
+        shipped = ["DEPOSITED_AT_PUDO", "IN_TRANSIT", "DELIVERED_TO_CARRIER",
+                   "ON_HOLD_AT_CARRIER", "ON_HOLD_INSTRUCTIONS_RECEIVED"]
+        for s in shipped:
+            assert WALLAPOP_TO_INTERNAL[s] == "ENVIADO"
 
 
-class TestLPNExtraction:
-
-    def test_extract_lpn_from_description(self):
-        match = LPN_PATTERN.search("LPNAB123456 Nintendo Switch Lite")
-        assert match is not None
-        assert match.group() == "LPNAB123456"
-
-    def test_no_lpn(self):
-        assert LPN_PATTERN.search("Product without LPN") is None
-
-    def test_lpn_in_middle(self):
-        match = LPN_PATTERN.search("Item: LPNXY999888 condition: good")
-        assert match is not None
-        assert match.group() == "LPNXY999888"
-
-
-class TestOrderResult:
-
-    def test_dataclass_defaults(self):
-        result = OrderResult(request_id="req-1", status="IN_TRANSIT", internal_status="SHIPPED")
-        assert result.is_bundle is False
-        assert result.bundle_items == []
-        assert result.lpn is None
-
-    def test_bundle_order(self):
-        result = OrderResult(
-            request_id="req-2",
-            status="DELIVERED",
-            internal_status="DELIVERED",
-            is_bundle=True,
-            bundle_items=[{"id": "item-1"}, {"id": "item-2"}],
+class TestOrderToDict:
+    def test_serialization(self):
+        from src.extractors.orders import OrderData
+        from src.parsers.lpn import LPNResult
+        order = OrderData(
+            request_id="req-1",
+            wallapop_status="IN_TRANSIT",
+            internal_status="ENVIADO",
+            item_title="Test Item",
+            lpn_result=LPNResult(lpns=["LPNWE001"], locations=["A/01"], num_products=1),
+            shipping={"carrier": "InPost", "tracking_code": "TR1"},
         )
-        assert result.is_bundle is True
-        assert len(result.bundle_items) == 2
+        d = WallapopOrdersExtractor._order_to_dict(order)
+        assert d["request_id"] == "req-1"
+        assert d["lpns"] == "LPNWE001"
+        assert d["carrier"] == "InPost"

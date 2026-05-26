@@ -1,34 +1,41 @@
 """
-Wallapop listings extractor with anti-oscillation logic.
+Wallapop listings extractor with anti-oscillation and stats accumulation.
 
-Wallapop re-publishes listings every ~3 days with a new product_id (item_hash).
-Without special handling, this causes false "new listing" detections and
-duplicate engagement metrics (views, favorites, conversations).
+IMPORTANT: Wallapop product_ids (item_hash) change with every resubmission
+(~every 3 days). The LPN is the real product identifier.
+
+The API can return the same LPN with different product_ids across pages
+within a single extraction run (old and new coexist).
 
 Anti-oscillation strategy:
-- Each LPN is processed once per extraction run (first occurrence wins).
-- previous_product_id tracks the last known ID to distinguish oscillations
-  from genuine re-publications.
-- Engagement metrics are accumulated across product_id changes, not reset.
+- Each LPN is processed ONCE per run (first occurrence wins).
+- previous_product_id is stored to distinguish oscillations from real changes.
+  If the "new" ID matches previous_product_id, it's oscillation → swap without
+  accumulating stats. Only truly new IDs trigger stat accumulation.
+
+Stats accumulation:
+- When product_id changes (real resubmission), current conversations/favorites/views
+  counters are added to *_accumulated fields before reset. This preserves
+  lifetime engagement metrics across Wallapop's forced resubmissions.
 """
 import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from .base_client import WallapopAPIClient
+from ..parsers.lpn import extract_single_lpn
 
 logger = logging.getLogger(__name__)
 
-LPN_PATTERN = re.compile(r"LPN[A-Z]{2}\d{6,12}", re.IGNORECASE)
-
 
 @dataclass
-class ListingResult:
-    """Parsed listing from the Wallapop published items API."""
+class ListingData:
+    """Parsed listing from Wallapop API."""
     lpn: str
+    account_id: int
     product_id: str
     title: str = ""
     description: str = ""
@@ -38,8 +45,10 @@ class ListingResult:
     sale_price: float = 0.0
     is_reserved: bool = False
     is_sold: bool = False
+    is_pending: bool = False
     is_banned: bool = False
     is_expired: bool = False
+    is_on_hold: bool = False
     conversations_count: int = 0
     favorites_count: int = 0
     views_count: int = 0
@@ -48,217 +57,293 @@ class ListingResult:
 
 
 @dataclass
-class ListingDelta:
-    """Tracks how a listing changed compared to its previous state."""
+class StoredListing:
+    """Represents a listing already in the database for comparison."""
     lpn: str
-    change_type: str  # "new", "updated", "oscillation", "product_id_changed", "unchanged"
-    old_product_id: Optional[str] = None
-    new_product_id: Optional[str] = None
-    accumulated_views: int = 0
-    accumulated_favorites: int = 0
-    accumulated_conversations: int = 0
+    product_id: str
+    previous_product_id: Optional[str] = None
+    conversations_count: int = 0
+    favorites_count: int = 0
+    views_count: int = 0
+    conversations_accumulated: int = 0
+    favorites_accumulated: int = 0
+    views_accumulated: int = 0
+    is_reserved: bool = False
+    is_sold: bool = False
+    is_pending: bool = False
+    is_banned: bool = False
+    is_expired: bool = False
+    is_on_hold: bool = False
+    sale_price: float = 0.0
+
+
+@dataclass
+class ListingUpdate:
+    """Describes what changed for a listing."""
+    lpn: str
+    action: str  # 'new', 'updated', 'product_id_changed', 'unchanged'
+    listing_data: ListingData
+    new_conversations_accumulated: int = 0
+    new_favorites_accumulated: int = 0
+    new_views_accumulated: int = 0
+    new_previous_product_id: Optional[str] = None
 
 
 class WallapopListingsExtractor(WallapopAPIClient):
     """
-    Extracts published listings from Wallapop's seller API.
-
-    Pagination: Uses cursor-based pagination (X-Nextpage header → since param).
-    Processes all pages until no more products are returned.
-
-    Anti-oscillation:
-    Wallapop rotates product IDs every ~3 days. This extractor tracks
-    previous_product_id to detect when a "new" ID is actually just the old
-    one coming back, preventing false metric accumulation.
+    Extracts listings from Wallapop with anti-oscillation and engagement
+    stat accumulation across resubmissions.
     """
 
     PRODUCTS_ENDPOINT = "/api/v3/items/mine/published"
     PAGE_SIZE = 100
+    DELAY_BETWEEN_REQUESTS = 0.1
     MAX_PRODUCTS = 100_000
 
-    def __init__(self, bearer_token: str, user_agents: list[str], **kwargs):
+    def __init__(self, bearer_token: str, user_agents: list[str], account_id: int = 0, **kwargs):
         super().__init__(bearer_token, user_agents, **kwargs)
+        self._account_id = account_id
         self._stats = {
-            "pages_fetched": 0,
-            "products_found": 0,
-            "with_lpn": 0,
-            "without_lpn": 0,
+            "products_extracted": 0,
+            "new": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "product_id_changes": 0,
+            "no_lpn": 0,
+            "errors": 0,
         }
-        self._seen_lpns: dict[str, str] = {}
 
-    def extract(self, **kwargs) -> dict[str, Any]:
-        """Extract all published listings."""
-        logger.info("Starting listings extraction")
+    def extract(
+        self,
+        existing_listings: Optional[dict[str, StoredListing]] = None,
+        on_update: Optional[Any] = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """
+        Extract all listings for this account.
+
+        Args:
+            existing_listings: Dict mapping LPN → StoredListing for comparison.
+                If None, all listings are treated as new.
+            on_update: Optional callback(ListingUpdate) for persistence.
+        """
+        if existing_listings is None:
+            existing_listings = {}
+
+        lpn_seen_this_run: dict[str, str] = {}
+        updates: list[ListingUpdate] = []
 
         next_token: Optional[str] = None
-        page = 0
-        results: list[ListingResult] = []
+        page = 1
 
-        while len(results) < self.MAX_PRODUCTS:
-            products, next_token = self._fetch_page(next_token)
-            page += 1
-            self._stats["pages_fetched"] = page
+        while self._stats["products_extracted"] < self.MAX_PRODUCTS:
+            products, next_token = self._fetch_products_page(next_token)
 
             if not products:
-                logger.info("No more products at page %d", page)
                 break
 
             logger.info("Page %d: %d products", page, len(products))
 
             for product in products:
+                self._stats["products_extracted"] += 1
+
                 parsed = self._parse_product(product)
                 if not parsed:
-                    self._stats["without_lpn"] += 1
+                    self._stats["no_lpn"] += 1
                     continue
 
-                if parsed.lpn in self._seen_lpns:
-                    continue
-
-                self._seen_lpns[parsed.lpn] = parsed.product_id
-                results.append(parsed)
-                self._stats["with_lpn"] += 1
-
-            self._stats["products_found"] += len(products)
+                update = self._process_listing(
+                    parsed, existing_listings, lpn_seen_this_run,
+                )
+                if update:
+                    updates.append(update)
+                    if on_update:
+                        on_update(update)
 
             if not next_token:
                 logger.info("End of pagination (no next token)")
                 break
 
-            time.sleep(self._random_delay())
+            page += 1
+            time.sleep(self.DELAY_BETWEEN_REQUESTS)
 
         logger.info(
-            "Extraction complete: %d products, %d with LPN, %d without",
-            self._stats["products_found"],
-            self._stats["with_lpn"],
-            self._stats["without_lpn"],
+            "Listings extraction: %d extracted, %d new, %d updated, "
+            "%d unchanged, %d product_id changes, %d no LPN",
+            self._stats["products_extracted"], self._stats["new"],
+            self._stats["updated"], self._stats["unchanged"],
+            self._stats["product_id_changes"], self._stats["no_lpn"],
         )
 
-        return {
-            "listings": [self._result_to_dict(r) for r in results],
-            **self._stats,
-        }
+        return {"updates": updates, "stats": self._stats}
 
-    def detect_changes(
-        self, current: list[ListingResult], previous_state: dict[str, dict],
-    ) -> list[ListingDelta]:
+    def _fetch_products_page(
+        self, since: Optional[str] = None,
+    ) -> tuple[list[dict], Optional[str]]:
         """
-        Compare current extraction with previous state to detect changes.
+        Fetch a page of products.
 
-        Args:
-            current: Current extraction results.
-            previous_state: Dict mapping LPN to previous listing state
-                (must include 'product_id', 'previous_product_id', and metric fields).
-
-        Returns:
-            List of ListingDelta objects describing what changed.
+        Pagination uses the X-Nextpage response header containing
+        a 'since=' token, not standard offset pagination.
         """
-        deltas = []
-        for listing in current:
-            prev = previous_state.get(listing.lpn)
-            if not prev:
-                deltas.append(ListingDelta(lpn=listing.lpn, change_type="new", new_product_id=listing.product_id))
-                continue
+        import requests as req
 
-            old_pid = prev.get("product_id", "")
-            if old_pid == listing.product_id:
-                deltas.append(ListingDelta(lpn=listing.lpn, change_type="unchanged"))
-                continue
-
-            prev_prev_pid = prev.get("previous_product_id")
-            if prev_prev_pid and listing.product_id == prev_prev_pid:
-                deltas.append(ListingDelta(
-                    lpn=listing.lpn,
-                    change_type="oscillation",
-                    old_product_id=old_pid,
-                    new_product_id=listing.product_id,
-                ))
-            else:
-                deltas.append(ListingDelta(
-                    lpn=listing.lpn,
-                    change_type="product_id_changed",
-                    old_product_id=old_pid,
-                    new_product_id=listing.product_id,
-                    accumulated_views=prev.get("views_count", 0),
-                    accumulated_favorites=prev.get("favorites_count", 0),
-                    accumulated_conversations=prev.get("conversations_count", 0),
-                ))
-
-        return deltas
-
-    def _fetch_page(self, since: Optional[str] = None) -> tuple[list[dict], Optional[str]]:
-        url = f"{self.BASE_URL}{self.PRODUCTS_ENDPOINT}"
         headers = self._build_headers()
-        params: dict = {}
+        params: dict[str, Any] = {}
         if since:
             params["since"] = since
         else:
             params["page_size"] = self.PAGE_SIZE
 
-        import requests as req
+        url = f"{self.BASE_URL}{self.PRODUCTS_ENDPOINT}"
         try:
-            response = req.get(url, headers=headers, params=params, timeout=self.REQUEST_TIMEOUT)
-            if response.status_code != 200:
-                logger.error("HTTP %d fetching listings page", response.status_code)
+            response = req.get(url, headers=headers, params=params, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()
+                products = data if isinstance(data, list) else []
+
+                next_token = None
+                next_header = response.headers.get("X-Nextpage", "")
+                if next_header and "since=" in next_header:
+                    since_part = next_header.split("since=")[1]
+                    next_token = since_part.split(":")[0] if ":" in since_part else since_part
+
+                return products, next_token
+
+            elif response.status_code == 401:
+                if self._refresh_callback:
+                    new_token = self._refresh_callback()
+                    if new_token:
+                        self._bearer = new_token
+                        return [], None
                 return [], None
 
-            data = response.json()
-            products = data if isinstance(data, list) else []
+            else:
+                logger.error("HTTP %d fetching products", response.status_code)
+                return [], None
 
-            next_token = None
-            next_header = response.headers.get("X-Nextpage", "")
-            if next_header and "since=" in next_header:
-                since_part = next_header.split("since=")[1]
-                next_token = since_part.split(":")[0] if ":" in since_part else since_part
-
-            return products, next_token
         except Exception as e:
-            logger.error("Error fetching listings page: %s", e)
+            logger.error("Error fetching products: %s", e)
             return [], None
 
-    def _parse_product(self, product: dict) -> Optional[ListingResult]:
-        try:
-            content = product.get("content", {})
-            flags = content.get("flags", {})
-            image = content.get("image", {})
-            description = content.get("description", "")
+    def _parse_product(self, product: dict) -> Optional[ListingData]:
+        content = product.get("content", {})
+        flags = content.get("flags", {})
+        image = content.get("image", {})
 
-            match = LPN_PATTERN.search(description or "")
-            if not match:
-                return None
-
-            return ListingResult(
-                lpn=match.group(),
-                product_id=product.get("id", ""),
-                title=content.get("title", ""),
-                description=description,
-                image_url=image.get("original", ""),
-                web_slug=content.get("web_slug", ""),
-                category_id=content.get("category_id"),
-                sale_price=content.get("sale_price", 0),
-                is_reserved=flags.get("reserved", False),
-                is_sold=flags.get("sold", False),
-                is_banned=flags.get("banned", False),
-                is_expired=flags.get("expired", False),
-                conversations_count=content.get("conversations", 0),
-                favorites_count=content.get("favorites", 0),
-                views_count=content.get("views", 0),
-                modified_timestamp=content.get("modified_date"),
-                published_timestamp=content.get("publish_date"),
-            )
-        except Exception as e:
-            logger.error("Error parsing product: %s", e)
+        description = content.get("description", "")
+        lpn = extract_single_lpn(description)
+        if not lpn:
             return None
 
-    @staticmethod
-    def _result_to_dict(r: ListingResult) -> dict:
-        return {
-            "lpn": r.lpn,
-            "product_id": r.product_id,
-            "title": r.title,
-            "sale_price": r.sale_price,
-            "is_reserved": r.is_reserved,
-            "is_sold": r.is_sold,
-            "conversations": r.conversations_count,
-            "favorites": r.favorites_count,
-            "views": r.views_count,
-        }
+        return ListingData(
+            lpn=lpn,
+            account_id=self._account_id,
+            product_id=product.get("id", ""),
+            title=content.get("title", ""),
+            description=description,
+            image_url=image.get("original", ""),
+            web_slug=content.get("web_slug", ""),
+            category_id=content.get("category_id"),
+            sale_price=content.get("sale_price", 0),
+            is_reserved=flags.get("reserved", False),
+            is_sold=flags.get("sold", False),
+            is_pending=flags.get("pending", False),
+            is_banned=flags.get("banned", False),
+            is_expired=flags.get("expired", False),
+            is_on_hold=flags.get("onhold", False),
+            conversations_count=content.get("conversations", 0),
+            favorites_count=content.get("favorites", 0),
+            views_count=content.get("views", 0),
+            modified_timestamp=content.get("modified_date"),
+            published_timestamp=content.get("publish_date"),
+        )
+
+    def _process_listing(
+        self,
+        parsed: ListingData,
+        existing: dict[str, StoredListing],
+        seen_this_run: dict[str, str],
+    ) -> Optional[ListingUpdate]:
+        """
+        Process a single listing with anti-oscillation logic.
+
+        Returns a ListingUpdate describing what action to take, or None
+        if this LPN was already processed in this run (dedup).
+        """
+        lpn = parsed.lpn
+        new_pid = parsed.product_id
+
+        if lpn in seen_this_run:
+            return None
+
+        seen_this_run[lpn] = new_pid
+
+        if lpn not in existing:
+            self._stats["new"] += 1
+            return ListingUpdate(lpn=lpn, action="new", listing_data=parsed)
+
+        stored = existing[lpn]
+        old_pid = stored.product_id or ""
+
+        if old_pid != new_pid:
+            is_oscillation = (
+                stored.previous_product_id is not None
+                and new_pid == stored.previous_product_id
+            )
+
+            if is_oscillation:
+                self._stats["updated"] += 1
+                return ListingUpdate(
+                    lpn=lpn,
+                    action="updated",
+                    listing_data=parsed,
+                    new_previous_product_id=old_pid,
+                )
+
+            new_conv_acc = (stored.conversations_accumulated or 0) + (stored.conversations_count or 0)
+            new_fav_acc = (stored.favorites_accumulated or 0) + (stored.favorites_count or 0)
+            new_views_acc = (stored.views_accumulated or 0) + (stored.views_count or 0)
+
+            self._stats["product_id_changes"] += 1
+            self._stats["updated"] += 1
+
+            logger.info(
+                "Product ID changed for %s: %s → %s "
+                "(accumulated: C=%d, F=%d, V=%d)",
+                lpn, old_pid[:12], new_pid[:12],
+                new_conv_acc, new_fav_acc, new_views_acc,
+            )
+
+            return ListingUpdate(
+                lpn=lpn,
+                action="product_id_changed",
+                listing_data=parsed,
+                new_conversations_accumulated=new_conv_acc,
+                new_favorites_accumulated=new_fav_acc,
+                new_views_accumulated=new_views_acc,
+                new_previous_product_id=old_pid,
+            )
+
+        stats_changed = (
+            stored.conversations_count != parsed.conversations_count
+            or stored.favorites_count != parsed.favorites_count
+            or stored.views_count != parsed.views_count
+        )
+        flags_changed = (
+            stored.is_reserved != parsed.is_reserved
+            or stored.is_sold != parsed.is_sold
+            or stored.is_pending != parsed.is_pending
+            or stored.is_banned != parsed.is_banned
+            or stored.is_expired != parsed.is_expired
+            or stored.is_on_hold != parsed.is_on_hold
+            or stored.sale_price != parsed.sale_price
+        )
+
+        if stats_changed or flags_changed:
+            self._stats["updated"] += 1
+            return ListingUpdate(lpn=lpn, action="updated", listing_data=parsed)
+
+        self._stats["unchanged"] += 1
+        return None

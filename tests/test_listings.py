@@ -1,139 +1,104 @@
-"""Tests for the listings extractor with anti-oscillation logic."""
+"""Tests for listings extractor anti-oscillation and stats accumulation."""
+import pytest
 from src.extractors.listings import (
-    WallapopListingsExtractor,
-    ListingResult,
-    ListingDelta,
-    LPN_PATTERN,
+    WallapopListingsExtractor, ListingData, StoredListing, ListingUpdate,
 )
 
 
-class TestLPNPattern:
+def _listing(lpn="LPN001", pid="pid-a", **kw):
+    defaults = {
+        "account_id": 1, "product_id": pid, "title": "Test",
+        "conversations_count": 10, "favorites_count": 5, "views_count": 100,
+    }
+    defaults.update(kw)
+    return ListingData(lpn=lpn, **defaults)
 
-    def test_matches_valid_lpn(self):
-        assert LPN_PATTERN.search("Producto LPNAB123456 en buen estado")
 
-    def test_no_match_without_lpn(self):
-        assert LPN_PATTERN.search("Producto sin identificador") is None
-
-    def test_case_insensitive(self):
-        assert LPN_PATTERN.search("lpncd789012")
+def _stored(lpn="LPN001", pid="pid-a", prev=None, **kw):
+    defaults = {
+        "conversations_count": 10, "favorites_count": 5, "views_count": 100,
+        "conversations_accumulated": 0, "favorites_accumulated": 0, "views_accumulated": 0,
+    }
+    defaults.update(kw)
+    return StoredListing(lpn=lpn, product_id=pid, previous_product_id=prev, **defaults)
 
 
 class TestAntiOscillation:
+    def test_same_pid_unchanged(self):
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed = _listing(pid="pid-a")
+        existing = {"LPN001": _stored(pid="pid-a")}
+        seen = {}
+        result = ext._process_listing(parsed, existing, seen)
+        assert result is None  # unchanged
+        assert ext._stats["unchanged"] == 1
 
-    def _make_listing(self, lpn="LPNAB123456", pid="pid-new"):
-        return ListingResult(lpn=lpn, product_id=pid)
-
-    def test_new_listing_detected(self):
-        extractor = WallapopListingsExtractor("token", ["UA/1.0"])
-        listings = [self._make_listing()]
-        previous_state = {}
-
-        deltas = extractor.detect_changes(listings, previous_state)
-
-        assert len(deltas) == 1
-        assert deltas[0].change_type == "new"
-
-    def test_unchanged_listing(self):
-        extractor = WallapopListingsExtractor("token", ["UA/1.0"])
-        listings = [self._make_listing(pid="pid-same")]
-        previous_state = {"LPNAB123456": {"product_id": "pid-same"}}
-
-        deltas = extractor.detect_changes(listings, previous_state)
-
-        assert len(deltas) == 1
-        assert deltas[0].change_type == "unchanged"
+    def test_new_pid_triggers_accumulation(self):
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed = _listing(pid="pid-b")
+        existing = {"LPN001": _stored(pid="pid-a")}
+        seen = {}
+        result = ext._process_listing(parsed, existing, seen)
+        assert result.action == "product_id_changed"
+        assert result.new_conversations_accumulated == 10
+        assert result.new_favorites_accumulated == 5
+        assert result.new_views_accumulated == 100
+        assert result.new_previous_product_id == "pid-a"
 
     def test_oscillation_detected(self):
-        """When new product_id matches previous_product_id, it's oscillation."""
-        extractor = WallapopListingsExtractor("token", ["UA/1.0"])
-        listings = [self._make_listing(pid="pid-old")]
-        previous_state = {
-            "LPNAB123456": {
-                "product_id": "pid-current",
-                "previous_product_id": "pid-old",
-            }
-        }
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed = _listing(pid="pid-a")
+        existing = {"LPN001": _stored(pid="pid-b", prev="pid-a")}
+        seen = {}
+        result = ext._process_listing(parsed, existing, seen)
+        assert result.action == "updated"
+        assert result.new_previous_product_id == "pid-b"
+        assert ext._stats["product_id_changes"] == 0
 
-        deltas = extractor.detect_changes(listings, previous_state)
-
-        assert len(deltas) == 1
-        assert deltas[0].change_type == "oscillation"
-        assert deltas[0].old_product_id == "pid-current"
-        assert deltas[0].new_product_id == "pid-old"
-
-    def test_real_product_id_change(self):
-        """A genuinely new product_id triggers metric accumulation."""
-        extractor = WallapopListingsExtractor("token", ["UA/1.0"])
-        listings = [self._make_listing(pid="pid-brand-new")]
-        previous_state = {
-            "LPNAB123456": {
-                "product_id": "pid-current",
-                "previous_product_id": "pid-old",
-                "views_count": 42,
-                "favorites_count": 5,
-                "conversations_count": 3,
-            }
-        }
-
-        deltas = extractor.detect_changes(listings, previous_state)
-
-        assert len(deltas) == 1
-        assert deltas[0].change_type == "product_id_changed"
-        assert deltas[0].accumulated_views == 42
-        assert deltas[0].accumulated_favorites == 5
-        assert deltas[0].accumulated_conversations == 3
-
-    def test_first_occurrence_wins(self):
-        """Same LPN seen twice in extraction - only first is kept."""
-        extractor = WallapopListingsExtractor("token", ["UA/1.0"])
-        l1 = self._make_listing(pid="pid-1")
-        l2 = self._make_listing(pid="pid-2")
-
-        extractor._seen_lpns[l1.lpn] = l1.product_id
-
-        assert l2.lpn in extractor._seen_lpns
-
-
-class TestParseProduct:
-
-    def test_parse_valid_product(self):
-        extractor = WallapopListingsExtractor("token", ["UA/1.0"])
-        product = {
-            "id": "abc123",
-            "content": {
-                "title": "Nintendo Switch",
-                "description": "LPNXY000001 Console in good condition",
-                "sale_price": 199,
-                "category_id": 15000,
-                "web_slug": "nintendo-switch-abc",
-                "conversations": 3,
-                "favorites": 10,
-                "views": 150,
-                "image": {"original": "https://cdn.wallapop.com/img.jpg"},
-                "flags": {
-                    "reserved": False,
-                    "sold": False,
-                    "banned": False,
-                    "expired": False,
-                },
-            },
-        }
-
-        result = extractor._parse_product(product)
-
-        assert result is not None
-        assert result.lpn == "LPNXY000001"
-        assert result.product_id == "abc123"
-        assert result.title == "Nintendo Switch"
-        assert result.conversations_count == 3
-
-    def test_parse_product_without_lpn_returns_none(self):
-        extractor = WallapopListingsExtractor("token", ["UA/1.0"])
-        product = {
-            "id": "abc123",
-            "content": {"title": "No LPN here", "description": "Just a regular product"},
-        }
-
-        result = extractor._parse_product(product)
+    def test_per_run_dedup(self):
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed1 = _listing(pid="pid-a")
+        parsed2 = _listing(pid="pid-b")
+        seen = {}
+        ext._process_listing(parsed1, {}, seen)
+        result = ext._process_listing(parsed2, {}, seen)
         assert result is None
+
+    def test_new_listing(self):
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed = _listing()
+        result = ext._process_listing(parsed, {}, {})
+        assert result.action == "new"
+
+    def test_stats_change_triggers_update(self):
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed = _listing(pid="pid-a", conversations_count=20)
+        existing = {"LPN001": _stored(pid="pid-a", conversations_count=10)}
+        result = ext._process_listing(parsed, existing, {})
+        assert result.action == "updated"
+
+    def test_flag_change_triggers_update(self):
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed = _listing(pid="pid-a", is_reserved=True)
+        existing = {"LPN001": _stored(pid="pid-a")}
+        result = ext._process_listing(parsed, existing, {})
+        assert result.action == "updated"
+
+    def test_accumulation_with_previous_accumulated(self):
+        ext = WallapopListingsExtractor("t", ["ua"], account_id=1)
+        parsed = _listing(pid="pid-c")
+        existing = {
+            "LPN001": _stored(
+                pid="pid-b",
+                conversations_count=15,
+                conversations_accumulated=30,
+                favorites_count=8,
+                favorites_accumulated=20,
+                views_count=200,
+                views_accumulated=500,
+            )
+        }
+        result = ext._process_listing(parsed, existing, {})
+        assert result.new_conversations_accumulated == 45
+        assert result.new_favorites_accumulated == 28
+        assert result.new_views_accumulated == 700

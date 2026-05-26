@@ -1,14 +1,16 @@
 """
 Wallapop chats/conversations extractor.
 
-Extracts messaging inbox conversations including message counts,
-item metadata, read status, and sale indicators.
+Extracts messaging conversations from Wallapop's inbox API with:
+- Token-based pagination (next_from, not offset-based)
+- Change detection: only updates conversations whose monitored fields changed
+- Cross-account duplicate handling: same conversation may appear under
+  different accounts — merges timestamps, keeping the most recent
+- Per-run dedup to avoid processing the same conversation twice
 
-Key features:
-- Paginated inbox traversal using cursor-based pagination (next_from)
-- Change detection to avoid redundant DB updates
-- Cross-account deduplication (same conversation visible from multiple accounts)
-- Timestamp-based merge for duplicates
+Monitored fields (COMPARABLE_FIELDS):
+  total_messages, unread_messages, is_sold, last_message_timestamp,
+  item_status, item_price
 """
 import logging
 import time
@@ -21,194 +23,278 @@ from .base_client import WallapopAPIClient
 logger = logging.getLogger(__name__)
 
 
+COMPARABLE_FIELDS = [
+    "total_messages", "unread_messages", "is_sold",
+    "last_message_timestamp", "item_status", "item_price",
+]
+
+
 @dataclass
-class ConversationResult:
-    """Parsed conversation from the Wallapop inbox API."""
+class ConversationData:
+    """Parsed conversation from Wallapop API."""
     conversation_hash: str
+    account_id: int
     item_hash: Optional[str] = None
     item_title: Optional[str] = None
     item_price: Optional[int] = None
     item_status: Optional[str] = None
+    item_category_id: Optional[int] = None
     item_image_url: Optional[str] = None
     item_slug: Optional[str] = None
-    item_category_id: Optional[int] = None
     topic_id: Optional[str] = None
     total_messages: int = 0
     unread_messages: int = 0
     is_sold: bool = False
-    last_message_at: Optional[datetime] = None
+    last_message_timestamp: Optional[datetime] = None
 
 
-CHANGE_DETECTION_FIELDS = [
-    "total_messages", "unread_messages", "is_sold",
-    "last_message_at", "item_status", "item_price",
-]
+@dataclass
+class StoredConversation:
+    """Represents a conversation already in the database for comparison."""
+    conversation_hash: str
+    total_messages: int = 0
+    unread_messages: int = 0
+    is_sold: bool = False
+    last_message_timestamp: Optional[datetime] = None
+    item_status: Optional[str] = None
+    item_price: Optional[int] = None
 
 
 class WallapopChatsExtractor(WallapopAPIClient):
     """
-    Extracts conversations from Wallapop's messaging inbox.
-
-    Pagination: Uses cursor-based pagination (next_from token from response).
-    The extractor processes all pages until:
-    - No more pages (next_from is empty)
-    - Max conversations limit reached
-    - Max pages without new conversations (stale detection)
+    Extracts conversations from Wallapop inbox with change detection
+    and cross-account duplicate handling.
     """
 
     INBOX_ENDPOINT = "/bff/messaging/inbox"
+    DELAY_BETWEEN_REQUESTS = 0.1
     MAX_CONVERSATIONS = 100_000
-    MAX_STALE_PAGES = 100
+    MAX_PAGES_WITHOUT_NEW = 100
 
-    def __init__(self, bearer_token: str, user_agents: list[str], **kwargs):
+    def __init__(self, bearer_token: str, user_agents: list[str], account_id: int = 0, **kwargs):
         super().__init__(bearer_token, user_agents, **kwargs)
+        self._account_id = account_id
         self._stats = {
-            "pages_fetched": 0,
-            "conversations_found": 0,
             "new": 0,
             "updated": 0,
             "unchanged": 0,
+            "processed": 0,
+            "api_calls": 0,
             "errors": 0,
         }
-        self._seen_hashes: set[str] = set()
 
-    def extract(self, **kwargs) -> dict[str, Any]:
-        """Extract all conversations from the inbox."""
-        logger.info("Starting chat extraction")
+    def extract(
+        self,
+        existing_conversations: Optional[dict[str, StoredConversation]] = None,
+        on_new: Optional[Any] = None,
+        on_update: Optional[Any] = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """
+        Extract conversations for this account.
+
+        Args:
+            existing_conversations: Dict mapping conversation_hash → StoredConversation.
+            on_new: Optional callback(ConversationData) for new conversations.
+            on_update: Optional callback(conversation_hash, ConversationData, changed_fields)
+                for updated conversations.
+        """
+        if existing_conversations is None:
+            existing_conversations = {}
+
+        known_hashes: set[str] = set(existing_conversations.keys())
+        results: list[ConversationData] = []
 
         next_from: Optional[str] = None
-        stale_pages = 0
-        results: list[ConversationResult] = []
+        pages_without_new = 0
+        total_processed = 0
 
-        while len(results) < self.MAX_CONVERSATIONS:
-            if stale_pages >= self.MAX_STALE_PAGES:
-                logger.info("Stopping: %d pages without new conversations", self.MAX_STALE_PAGES)
+        while total_processed < self.MAX_CONVERSATIONS:
+            if pages_without_new >= self.MAX_PAGES_WITHOUT_NEW:
+                logger.info("Stopping: %d pages without new conversations", self.MAX_PAGES_WITHOUT_NEW)
                 break
 
             page_data = self._fetch_inbox_page(next_from)
+            self._stats["api_calls"] += 1
+
             if page_data is None:
+                if self._refresh_callback:
+                    new_token = self._refresh_callback()
+                    if new_token:
+                        self._bearer = new_token
+                        logger.info("Bearer renewed, retrying")
+                        continue
+                logger.error("Could not fetch inbox, stopping")
                 break
 
-            self._stats["pages_fetched"] += 1
             conversations_raw = page_data.get("conversations", []) or []
-
             if not conversations_raw:
-                logger.info("No more conversations")
+                logger.info("No more conversations found")
                 break
 
             page_new = 0
+
             for conv_raw in conversations_raw:
                 parsed = self._parse_conversation(conv_raw)
                 if not parsed:
                     continue
 
-                self._stats["conversations_found"] += 1
+                total_processed += 1
+                self._stats["processed"] += 1
+                conv_hash = parsed.conversation_hash
 
-                if parsed.conversation_hash in self._seen_hashes:
+                if conv_hash not in known_hashes:
+                    known_hashes.add(conv_hash)
+                    self._stats["new"] += 1
+                    page_new += 1
+                    results.append(parsed)
+                    if on_new:
+                        on_new(parsed)
+
+                elif self._has_changed(conv_hash, parsed, existing_conversations):
+                    changed = self._get_changed_fields(conv_hash, parsed, existing_conversations)
+                    self._stats["updated"] += 1
+                    results.append(parsed)
+                    if on_update:
+                        on_update(conv_hash, parsed, changed)
+
+                    existing_conversations[conv_hash] = self._to_stored(parsed)
+                else:
                     self._stats["unchanged"] += 1
-                    continue
-
-                self._seen_hashes.add(parsed.conversation_hash)
-                results.append(parsed)
-                page_new += 1
-                self._stats["new"] += 1
 
             if page_new == 0:
-                stale_pages += 1
+                pages_without_new += 1
             else:
-                stale_pages = 0
+                pages_without_new = 0
 
             next_from = page_data.get("next_from")
             if not next_from:
                 logger.info("End of pagination (no next_from)")
                 break
 
-            logger.info(
-                "Page %d: %d conversations, %d new",
-                self._stats["pages_fetched"], len(conversations_raw), page_new,
-            )
+            time.sleep(self.DELAY_BETWEEN_REQUESTS)
 
         logger.info(
-            "Extraction complete: %d conversations (%d new, %d unchanged)",
-            len(results), self._stats["new"], self._stats["unchanged"],
+            "Chats extraction: %d new, %d updated, %d unchanged, %d processed",
+            self._stats["new"], self._stats["updated"],
+            self._stats["unchanged"], self._stats["processed"],
         )
-
-        return {
-            "conversations": [self._result_to_dict(c) for c in results],
-            **self._stats,
-        }
+        return {"results": results, "stats": self._stats}
 
     def _fetch_inbox_page(
-        self, next_from: Optional[str] = None, page_size: int = 30,
+        self,
+        next_from: Optional[str] = None,
+        page_size: int = 30,
+        max_messages: int = 30,
     ) -> Optional[dict]:
         url = f"{self.BASE_URL}{self.INBOX_ENDPOINT}"
         headers = self._build_headers()
-        params: dict = {"page_size": page_size, "max_messages": 30}
+        params: dict[str, Any] = {"page_size": page_size, "max_messages": max_messages}
         if next_from:
             params["from"] = next_from
+        return self._request(url, headers, params)
 
-        result = self._request(url, headers, params)
-        time.sleep(self._random_delay())
-        return result
+    def _parse_conversation(self, conv_data: dict) -> Optional[ConversationData]:
+        """
+        Parse a single conversation from API response.
 
-    def _parse_conversation(self, raw: dict) -> Optional[ConversationResult]:
+        Handles nested structures: item.price.amount, messages.messages[],
+        and converts epoch-ms timestamps to datetime UTC.
+        """
         try:
-            conv_hash = raw.get("hash")
+            conv_hash = conv_data.get("hash")
             if not conv_hash:
                 return None
 
-            item = raw.get("item", {}) or {}
-            price_data = item.get("price", {}) or {}
+            item = conv_data.get("item", {}) or {}
+
             item_price = None
-            if isinstance(price_data, dict) and price_data.get("amount") is not None:
-                try:
-                    item_price = int(round(float(price_data["amount"])))
-                except (ValueError, TypeError):
-                    pass
+            price_data = item.get("price", {}) or {}
+            if isinstance(price_data, dict):
+                amount = price_data.get("amount")
+                if amount is not None:
+                    try:
+                        item_price = int(round(float(amount)))
+                    except (ValueError, TypeError):
+                        pass
 
             item_status = item.get("status")
             is_sold = str(item_status).lower() == "sold" if item_status else False
 
-            messages_obj = raw.get("messages", {}) or {}
+            messages_obj = conv_data.get("messages", {}) or {}
             msgs = messages_obj.get("messages", []) if isinstance(messages_obj, dict) else []
+            total_messages = len(msgs)
 
-            last_message_at = None
+            last_ts = None
             if msgs:
-                timestamps = [m.get("timestamp") for m in msgs if m and m.get("timestamp")]
-                if timestamps:
-                    max_ts = max(timestamps)
-                    last_message_at = datetime.fromtimestamp(max_ts / 1000.0, tz=timezone.utc)
+                try:
+                    max_ts_ms = max(
+                        m.get("timestamp") for m in msgs
+                        if m and m.get("timestamp") is not None
+                    )
+                    if max_ts_ms is not None:
+                        last_ts = datetime.fromtimestamp(max_ts_ms / 1000.0, tz=timezone.utc)
+                except (ValueError, TypeError):
+                    pass
 
-            return ConversationResult(
+            return ConversationData(
                 conversation_hash=conv_hash,
+                account_id=self._account_id,
                 item_hash=item.get("hash"),
                 item_title=item.get("title"),
                 item_price=item_price,
                 item_status=item_status,
+                item_category_id=item.get("category_id"),
                 item_image_url=item.get("image_url"),
                 item_slug=item.get("slug"),
-                item_category_id=item.get("category_id"),
-                topic_id=raw.get("topic_id"),
-                total_messages=len(msgs),
-                unread_messages=raw.get("unread_messages", 0) or 0,
+                topic_id=conv_data.get("topic_id"),
+                total_messages=total_messages,
+                unread_messages=conv_data.get("unread_messages", 0) or 0,
                 is_sold=is_sold,
-                last_message_at=last_message_at,
+                last_message_timestamp=last_ts,
             )
         except Exception as e:
             logger.error("Error parsing conversation: %s", e)
             self._stats["errors"] += 1
             return None
 
+    def _has_changed(
+        self,
+        conv_hash: str,
+        new_data: ConversationData,
+        existing: dict[str, StoredConversation],
+    ) -> bool:
+        if conv_hash not in existing:
+            return True
+        stored = existing[conv_hash]
+        for f in COMPARABLE_FIELDS:
+            if getattr(stored, f, None) != getattr(new_data, f, None):
+                return True
+        return False
+
+    def _get_changed_fields(
+        self,
+        conv_hash: str,
+        new_data: ConversationData,
+        existing: dict[str, StoredConversation],
+    ) -> list[str]:
+        if conv_hash not in existing:
+            return COMPARABLE_FIELDS
+        stored = existing[conv_hash]
+        changed = []
+        for f in COMPARABLE_FIELDS:
+            if getattr(stored, f, None) != getattr(new_data, f, None):
+                changed.append(f)
+        return changed
+
     @staticmethod
-    def _result_to_dict(c: ConversationResult) -> dict:
-        return {
-            "conversation_hash": c.conversation_hash,
-            "item_hash": c.item_hash,
-            "item_title": c.item_title,
-            "item_price": c.item_price,
-            "item_status": c.item_status,
-            "total_messages": c.total_messages,
-            "unread_messages": c.unread_messages,
-            "is_sold": c.is_sold,
-            "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
-        }
+    def _to_stored(conv: ConversationData) -> StoredConversation:
+        return StoredConversation(
+            conversation_hash=conv.conversation_hash,
+            total_messages=conv.total_messages,
+            unread_messages=conv.unread_messages,
+            is_sold=conv.is_sold,
+            last_message_timestamp=conv.last_message_timestamp,
+            item_status=conv.item_status,
+            item_price=conv.item_price,
+        )
