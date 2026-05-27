@@ -1,4 +1,5 @@
-# Wallapop Data Extractors
+﻿# Wallapop Data Extractors
+> **Portfolio context:** Extracted from founder-led production systems — multi-marketplace inventory, orders, and warehouse execution. **[Full portfolio](https://github.com/AspiranteD)** · [aspiranted.github.io](https://aspiranted.github.io)
 
 Production-grade data extraction framework for the Wallapop marketplace API. Extracts orders, conversations, and listings across multiple seller accounts with anti-detection, anti-oscillation, and robust error handling.
 
