@@ -1,5 +1,5 @@
-﻿# Wallapop Data Extractors
-> **Portfolio context:** Extracted from founder-led production systems — multi-marketplace inventory, orders, and warehouse execution. **[Full portfolio](https://github.com/AspiranteD)** · [aspiranted.github.io](https://aspiranted.github.io)
+# Wallapop Data Extractors
+> **Portfolio context:** Extracted from founder-led production systems � multi-marketplace inventory, orders, and warehouse execution. **[Full portfolio](https://github.com/AspiranteD/AspiranteD)** � [aspiranted.github.io](https://aspiranted.github.io)
 
 Production-grade data extraction framework for the Wallapop marketplace API. Extracts orders, conversations, and listings across multiple seller accounts with anti-detection, anti-oscillation, and robust error handling.
 
@@ -7,16 +7,16 @@ Production-grade data extraction framework for the Wallapop marketplace API. Ext
 
 ```
 src/
-├── extractors/
-│   ├── base_client.py         # Abstract API client: anti-detection, retries, rate limiting
-│   ├── orders.py              # Orders extractor with bundle/LPN/shipping enrichment
-│   ├── chats.py               # Conversations extractor with change detection
-│   └── listings.py            # Listings extractor with anti-oscillation
-├── parsers/
-│   ├── lpn.py                 # LPN regex extraction with location parsing
-│   ├── shipping.py            # Carrier detection, deadline parsing, label URL conversion
-│   ├── dates.py               # Spanish-English bilingual date conversion
-│   └── status.py              # Wallapop → internal status mapping (18 states → 9)
++-- extractors/
+�   +-- base_client.py         # Abstract API client: anti-detection, retries, rate limiting
+�   +-- orders.py              # Orders extractor with bundle/LPN/shipping enrichment
+�   +-- chats.py               # Conversations extractor with change detection
+�   +-- listings.py            # Listings extractor with anti-oscillation
++-- parsers/
+�   +-- lpn.py                 # LPN regex extraction with location parsing
+�   +-- shipping.py            # Carrier detection, deadline parsing, label URL conversion
+�   +-- dates.py               # Spanish-English bilingual date conversion
+�   +-- status.py              # Wallapop ? internal status mapping (18 states ? 9)
 ```
 
 ## Key Technical Features
@@ -34,10 +34,10 @@ The API client randomizes every aspect of requests to avoid bot detection:
 
 ### Orders Enrichment Pipeline (orders.py)
 Four-stage data enrichment per order:
-1. **Deliveries list** → active orders
-2. **Transaction tracking** → shipping details (carrier, tracking code, deadline)
-3. **Item vertical** → product details (description → LPN extraction)
-4. **Bundle details** → individual items via `wallapop://i/` deep links
+1. **Deliveries list** ? active orders
+2. **Transaction tracking** ? shipping details (carrier, tracking code, deadline)
+3. **Item vertical** ? product details (description ? LPN extraction)
+4. **Bundle details** ? individual items via `wallapop://i/` deep links
 
 **LPN Extraction**: Flexible regex `LPN[A-Za-z0-9]{3,}` captures:
 - Amazon FBA format: `LPNWE324817902`
@@ -46,13 +46,13 @@ Four-stage data enrichment per order:
 
 **Bundle Handling**: Multi-item orders embed item hashes as `wallapop://i/{hash}` deep links in `details_info`. Each hash is fetched individually to extract per-item LPNs.
 
-**Price Splitting**: Total order price ÷ number of LPNs for multi-item listings.
+**Price Splitting**: Total order price � number of LPNs for multi-item listings.
 
 ### Shipping Details Parsing (shipping.py)
 - **Carrier detection**: Identifies InPost/Correos/Seur from icon URLs (primary) and description text (fallback)
 - **Deadline extraction**: Multiple regex patterns parse dates from HTML `<b>` and `<strong>` tags, validated for date-like content
 - **Tracking code**: Structured extraction from `action.payload.banner.tracking_code` with HTML `<strong>` fallback
-- **Label URL conversion**: `wallapop://trackinglabel?url=X` → `X`, `wallapop://delivery/barcode?b=X` → web URL
+- **Label URL conversion**: `wallapop://trackinglabel?url=X` ? `X`, `wallapop://delivery/barcode?b=X` ? web URL
 
 ### Bilingual Date Parsing (dates.py)
 Shipping deadlines arrive as localized Spanish strings (e.g., "Viernes, 23 Mayo 2025"). The parser translates Spanish day/month names to English, then uses standard `strptime` parsing.
@@ -65,13 +65,13 @@ Wallapop forces listing resubmission every ~3 days, changing the `product_id`. T
 
 **Strategy**:
 1. **Per-run dedup**: Each LPN processed once per extraction (first occurrence wins)
-2. **Oscillation detection**: If "new" product_id matches `previous_product_id`, it's oscillation → swap IDs without accumulating stats
+2. **Oscillation detection**: If "new" product_id matches `previous_product_id`, it's oscillation ? swap IDs without accumulating stats
 3. **Real change**: Truly new product_ids trigger stat accumulation (conversations, favorites, views added to `*_accumulated` fields)
 
 ### Conversation Change Detection (chats.py)
 - **Token-based pagination**: Uses `next_from` tokens, not offset-based
 - **COMPARABLE_FIELDS**: Only updates conversations where monitored fields changed (total_messages, unread_messages, is_sold, last_message_timestamp, item_status, item_price)
-- **Cross-account merge**: Same conversation may appear under different accounts — timestamps are merged keeping the most recent
+- **Cross-account merge**: Same conversation may appear under different accounts � timestamps are merged keeping the most recent
 
 ## Usage
 
